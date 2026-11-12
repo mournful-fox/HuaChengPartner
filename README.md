@@ -6,8 +6,10 @@
 и выполняет поручения: напоминает, ставит будильник, открывает сайты, приложения и папки,
 разбирает «Загрузки» и закрывает забытые вкладки Chrome.
 
+<img width="508" height="399" alt="pet" src="https://github.com/user-attachments/assets/77f5506c-75ad-4106-9cf1-2879e9d681d7" />
+
+
 Проект вдохновлён [DeskPartner](https://github.com/Forecastych/DeskPartner). Код написан с нуля.
-<img width="1215" height="1232" alt="image" src="https://github.com/user-attachments/assets/ab7478b5-f74b-4826-bc72-f6ea2bf4e4f0" />
 
 ## Содержание
 
