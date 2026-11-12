@@ -1,0 +1,10 @@
+# сборка
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# личные данные — никогда не коммить (там API-ключи)
+config.json
+.env
