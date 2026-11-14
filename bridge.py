@@ -17,7 +17,8 @@ class Bridge:
         self.sock = None
         self.pending = {}
         self.ids = itertools.count(1)
-        self.ok = self.server.listen(QHostAddress.LocalHost, PORT)
+        from characters import me
+        self.ok = self.server.listen(QHostAddress.LocalHost, PORT + me().port)   # у каждого персонажа свой порт
         self.server.newConnection.connect(self._on_conn)
 
     def connected(self):
@@ -49,6 +50,9 @@ class Bridge:
         try:
             m = json.loads(text)
         except ValueError:
+            return
+        if m.get("event") == "tab":            # расширение сообщает, что вкладка открыла адрес
+            self.w.on_tab(m.get("url", ""), m.get("tabId"))
             return
         cb = self.pending.pop(m.get("id"), None)
         if cb:

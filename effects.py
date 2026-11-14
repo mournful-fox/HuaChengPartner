@@ -25,14 +25,23 @@ class ButterflySprite:
         self.body = body
         self.cache = {}
 
-    def get(self, h):
+    def get(self, h, red=False):
         h = max(8, int(h))
-        if h not in self.cache:
-            self.cache[h] = self.src.scaledToHeight(h, Qt.SmoothTransformation)
-        return self.cache[h]
+        key = (h, red)
+        if key not in self.cache:
+            pm = self.src.scaledToHeight(h, Qt.SmoothTransformation)
+            if red:                          # алый оттенок поверх свечения (украшение из лавки)
+                from PySide6.QtGui import QPainter as _P
+                pm = pm.copy()
+                p = _P(pm)
+                p.setCompositionMode(_P.CompositionMode_SourceAtop)
+                p.fillRect(pm.rect(), QColor(220, 30, 50, 150))
+                p.end()
+            self.cache[key] = pm
+        return self.cache[key]
 
-    def draw(self, p, x, y, tilt_deg, flap, height, alpha, face_left=False):
-        pm = self.get(height)
+    def draw(self, p, x, y, tilt_deg, flap, height, alpha, face_left=False, red=False):
+        pm = self.get(height, red)
         bx, by = self.body[0] * pm.width(), self.body[1] * pm.height()
         p.save()
         p.translate(x, y)
@@ -48,8 +57,8 @@ class ButterflySprite:
 SPRITE = None
 
 
-def draw_butterfly(p, x, y, tilt_deg, flap, size, alpha, face_left=False):
-    SPRITE.draw(p, x, y, tilt_deg, flap, size * 3.8, alpha, face_left)
+def draw_butterfly(p, x, y, tilt_deg, flap, size, alpha, face_left=False, red=False):
+    SPRITE.draw(p, x, y, tilt_deg, flap, size * 3.8, alpha, face_left, red)
 
 
 class Butterfly:
@@ -263,12 +272,20 @@ class Swarm:
         self.dust = [d for d in self.dust if d[4] > 0][-400:]
 
     def draw(self, p):
+        if not getattr(self.w, "char", None) or not self.w.char.butterflies:
+            return                                  # бабочки — только у Хуа Чена
         p.setPen(Qt.NoPen)
+        gold = self.w.has("gold_dust") if hasattr(self.w, "has") else False
+        red_on = self.w.has("red_bf") if hasattr(self.w, "has") else False
+        halo = QColor(255, 205, 110) if gold else QColor(180, 205, 255)
+        core = QColor(255, 236, 170) if gold else QColor(255, 255, 255)
         for x, y, _, _, life, sz in self.dust:
             a = int(255 * life)
-            p.setBrush(QColor(180, 205, 255, a // 4))
+            halo.setAlpha(a // 4)
+            core.setAlpha(a)
+            p.setBrush(halo)
             p.drawEllipse(QPointF(x, y), sz * 2.2, sz * 2.2)
-            p.setBrush(QColor(255, 255, 255, a))
+            p.setBrush(core)
             p.drawEllipse(QPointF(x, y), sz * 0.7, sz * 0.7)
         for b in self.items:
             if b.alpha <= 0.01:
@@ -280,7 +297,8 @@ class Swarm:
             flap = abs(math.sin(b.t * b.freq + b.phase))
             tilt = clamp(b.vy / 10.0, -25, 25) * (-1 if b.vx < 0 else 1)
             bob = math.sin(b.t * b.freq * 0.5 + b.phase) * 2
-            draw_butterfly(p, b.x, b.y + bob, tilt, flap, b.size, b.alpha, face_left=b.vx < 0)
+            red = red_on and (id(b) // 16) % 3 == 0
+            draw_butterfly(p, b.x, b.y + bob, tilt, flap, b.size, b.alpha, face_left=b.vx < 0, red=red)
 
     def bounds(self):
         out = [b.bounds() for b in self.items]
@@ -594,10 +612,12 @@ class Bubble:
         tail.lineTo(tx, r.bottom() + 11)
         tail.lineTo(tx + 8, r.bottom() - 1)
         path = path.united(tail)
-        p.setPen(QPen(QColor(205, 215, 230), 1.4))
-        p.setBrush(QColor(45, 10, 16, 232))
+        from characters import me
+        th = me().theme
+        p.setPen(QPen(QColor(*th["bubble_border"]), 1.4))
+        p.setBrush(QColor(*th["bubble_bg"]))
         p.drawPath(path)
-        p.setPen(QColor(248, 238, 238))
+        p.setPen(QColor(*th["bubble_text"]))
         p.setFont(self.font)
         p.drawText(r.adjusted(10, 10, -10, -10), Qt.TextWordWrap, self.text)
         p.setOpacity(1)

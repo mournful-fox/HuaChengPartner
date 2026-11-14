@@ -1,0 +1,1 @@
+--noconfirm --noconsole --onefile --name HuaCheng --icon assets\icon.ico --add-data "assets;assets" --hidden-import PySide6.QtWebSockets --hidden-import PySide6.QtNetwork --hidden-import winsound --exclude-module tkinter

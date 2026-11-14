@@ -7,6 +7,7 @@
 import datetime
 import json
 import os
+import random
 import re
 import shutil
 import threading
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.request
 
 import tools_pc
+from characters import NAMES, me
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -82,6 +84,47 @@ TOOLS = [
          "Укажи time (ЧЧ:ММ) или in_minutes.",
          {"time": {"type": "string"}, "date": {"type": "string"}, "in_minutes": {"type": "integer"},
           "text": {"type": "string", "description": "подпись, например «Вставать»"}}),
+    tool("look_at_screen", "Посмотреть на экран пользователя (сделать снимок экрана), чтобы ответить на вопрос "
+         "о том, что там видно: ошибка, текст, картинка, письмо и т.п."),
+    tool("remember", "Запомнить факт о пользователе надолго (предпочтения, имена близких, привычки, планы).",
+         {"fact": {"type": "string"}}, ["fact"]),
+    tool("list_memories", "Показать, что ты помнишь о пользователе (с номерами)."),
+    tool("forget", "Забыть факт по номеру из list_memories.", {"number": {"type": "integer"}}, ["number"]),
+    tool("remember_date", "Запомнить важную дату (день рождения, годовщина): заранее и в сам день напомнишь. "
+         "date — ДД.ММ. who_is_user=true, если это день рождения самого пользователя.",
+         {"date": {"type": "string"}, "what": {"type": "string"}, "who_is_user": {"type": "boolean"}},
+         ["date", "what"]),
+    tool("get_weather", "Узнать погоду. city — город; если не указан, берётся город пользователя из настроек.",
+         {"city": {"type": "string"}}),
+    tool("set_city", "Запомнить город пользователя для погоды и утренней сводки.",
+         {"city": {"type": "string"}}, ["city"]),
+    tool("media_control", "Управлять музыкой/видео на компьютере: play_pause, next, previous, volume_up, "
+         "volume_down, mute. steps — сколько раз (для громкости, один шаг ≈ 2%).",
+         {"action": {"type": "string", "enum": ["play_pause", "next", "previous", "volume_up", "volume_down", "mute"]},
+          "steps": {"type": "integer"}}, ["action"]),
+    tool("start_timer", "Запустить таймер (например, на готовку): над тобой будет обратный отсчёт.",
+         {"minutes": {"type": "number"}, "label": {"type": "string"}}, ["minutes"]),
+    tool("screen_time", "Сколько пользователь сегодня (или в другой день) провёл за компьютером и в каких программах.",
+         {"date": {"type": "string", "description": "ГГГГ-ММ-ДД, по умолчанию сегодня"}}),
+    tool("write_diary", "Записать в дневник пользователя, как прошёл его день (кратко, своими словами).",
+         {"text": {"type": "string"}}, ["text"]),
+    tool("read_diary", "Прочитать записи дневника за последние дни.", {"days": {"type": "integer"}}),
+    tool("coins", "Узнать, сколько у пользователя монет Призрачного города и что можно купить в лавке."),
+    tool("call_friend", "Позвать на рабочий стол другого персонажа: hua — Хуа Чен (хозяйство, напоминания), "
+         "wwx — Вэй Усянь (развлечения), lz — Лань Чжань (работа и учёба).",
+         {"who": {"type": "string", "enum": ["hua", "wwx", "lz"]}}, ["who"]),
+    tool("pick_movies", "Выбрать три фильма на вечер и открыть их вкладками в браузере. "
+         "genre: jackie — боевики с Джеки Чаном, wuxia — уся-фэнтези, any — и то и другое.",
+         {"genre": {"type": "string", "enum": ["jackie", "wuxia", "any"]}}),
+    tool("make_presentation", "Сделать презентацию PowerPoint (.pptx) и открыть её. Если пользователь просит сделать её "
+         "по документу (статье, рукописи, конспекту) — ОБЯЗАТЕЛЬНО передай source: имя или путь файла, инструмент сам "
+         "его найдёт и прочитает. slides — число слайдов (по умолчанию 7); details — пожелания: для кого, акценты.",
+         {"topic": {"type": "string", "description": "тема; если есть source, можно коротко"},
+          "source": {"type": "string", "description": "имя или путь файла-источника (.docx, .pdf, .pptx, .tex, .txt, .md) либо папки, где он лежит"},
+          "slides": {"type": "integer"}, "details": {"type": "string"}}, ["topic"]),
+    tool("read_file", "Прочитать текст документа на компьютере (.docx, .pdf, .pptx, .tex, .txt, .md, .csv; можно путь к папке), чтобы ответить на вопрос "
+         "о нём, пересказать или сделать выжимку. file — имя или путь.",
+         {"file": {"type": "string"}}, ["file"]),
     tool("start_focus", "Включить фокус-таймер (работа без отвлечений, потом перерыв).",
          {"minutes": {"type": "integer", "description": "длительность, по умолчанию 25"}}),
     tool("roll_dice", "Бросить кости. question=true — чтобы кости ответили «да» или «нет».",
@@ -342,6 +385,8 @@ PROVIDERS = {
                "keys": "https://aistudio.google.com/apikey"},
     "groq": {"title": "Groq (бесплатно)", "model": "openai/gpt-oss-120b", "fallback": "openai/gpt-oss-20b",
              "base": "https://api.groq.com/openai/v1", "keys": "https://console.groq.com/keys"},
+    "xai": {"title": "xAI Grok (платно)", "model": "",
+            "base": "https://api.x.ai/v1", "keys": "https://console.x.ai"},
     "openai": {"title": "OpenAI (платно)", "model": "",
                "base": "https://api.openai.com/v1", "keys": "https://platform.openai.com/api-keys"},
 }
@@ -369,6 +414,38 @@ def cloud_models(provider, key):
     return sorted(set(ids))
 
 
+TRANSCRIBE_MODELS = {"openai": ["gpt-4o-mini-transcribe", "whisper-1"],
+                     "groq": ["whisper-large-v3-turbo", "whisper-large-v3"]}
+
+
+def transcribe(base, key, wav, models):
+    """Отправляет запись на распознавание (/audio/transcriptions) и возвращает текст."""
+    import uuid
+    last = None
+    for model in models:
+        b = "----hua" + uuid.uuid4().hex
+        parts = []
+        for name, val in (("model", model), ("language", "ru"),
+                          ("prompt", "Возможны английские слова: lo-fi, YouTube, Spotify, Discord.")):
+            parts.append(f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode())
+        parts.append(f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+                     f'Content-Type: audio/wav\r\n\r\n'.encode() + wav + b"\r\n")
+        parts.append(f"--{b}--\r\n".encode())
+        req = urllib.request.Request(base + "/audio/transcriptions", data=b"".join(parts),
+                                     headers={"Authorization": "Bearer " + key,
+                                              "Content-Type": "multipart/form-data; boundary=" + b})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode("utf-8")).get("text", "").strip()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (400, 404):    # 400/404 — такой модели нет, пробуем следующую
+                raise
+    if last:
+        raise last
+    return ""
+
+
 class _Net(QObject):
     done = Signal(object, object)       # (ответ, ошибка)
     tool_done = Signal(object, object)  # (колбэк инструмента, результат фоновой работы)
@@ -388,7 +465,10 @@ class Agent:
         self.rounds = 0
 
     # ── публичное ──
-    def ask(self, text, on_reply, audio=None):
+    def ask_with_image(self, text, image_b64, on_reply):
+        self.ask(text or "Посмотри на мой экран и помоги.", on_reply, image=image_b64)
+
+    def ask(self, text, on_reply, audio=None, image=None):
         if self.busy:
             on_reply("Подожди, я ещё думаю над прошлым.")
             return
@@ -403,11 +483,17 @@ class Agent:
         msg = {"role": "user", "content": text}
         if audio:
             msg["audio"] = audio
+        if image:
+            msg["image"] = image
         self.history.append(msg)
         self.history = self.history[-12:]
         while self.history and self.history[0]["role"] != "user":   # не начинаем с обрывка
             self.history.pop(0)
-        r = route(text) if self.local() and not audio else None
+        for old in self.history[:-1]:
+            if old.get("image"):
+                old.pop("image")
+                old["content"] = (old.get("content") or "") + " [снимок экрана]"
+        r = route(text) if self.local() and not audio and not image else None
         if r:                                   # очевидная просьба — выполняем сразу, без модели
             calls = [{"id": "call_route", "function": {"name": r[0], "arguments": r[1]}}]
             self.history.append({"role": "assistant", "content": "", "tool_calls": calls})
@@ -420,6 +506,85 @@ class Agent:
                   "писать (lo-fi, YouTube, Spotify, Discord), а не русскими буквами на слух.\n"
                   "Первой строкой ответа запиши, что услышал, в формате:\n>> текст\n"
                   "Со второй строки — твой ответ (или вызови инструмент).")
+
+    def persona(self):
+        return me().persona or SYSTEM
+
+    def tools(self):
+        ex = me().exclude
+        extra = getattr(self.w.extra, "TOOLS", []) if getattr(self.w, "extra", None) else []
+        return [t for t in TOOLS if t["function"]["name"] not in ex] + list(extra)
+
+    def one_shot(self, prompt, cb, system=None, long=False):
+        """Отдельный запрос к модели без истории и инструментов. cb(текст или None)."""
+        system = system or self.persona().format(addr=self.w.cfg["address"])
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        if self.local():
+            url = self.url("/api/chat")
+            body = {"model": self.model(), "messages": msgs, "stream": False, "think": False,
+                    "keep_alive": "60m", "options": {"temperature": 0.8, "num_ctx": 16384 if long else 4096,
+                                "num_predict": 3000 if long else 700}}
+            headers = {"Content-Type": "application/json"}
+        else:
+            if not self.key():
+                QTimer.singleShot(0, lambda: cb(None))
+                return
+            url = PROVIDERS[self.provider()]["base"] + "/chat/completions"
+            body = {"model": self.model(), "messages": msgs, "temperature": 0.8}
+            eff = self.effort()
+            if eff:
+                body["reasoning_effort"] = eff
+            headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.key()}
+
+        def work():
+            text = None
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+                    with urllib.request.urlopen(req, timeout=180) as r:
+                        data = json.loads(r.read().decode("utf-8"))
+                    msg = data.get("message") if self.local() else (data.get("choices") or [{}])[0].get("message", {})
+                    text = re.sub(r"<think>.*?</think>", "", (msg or {}).get("content") or "", flags=re.S).strip()
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 400 and "reasoning_effort" in body:
+                        body.pop("reasoning_effort")
+                        continue
+                    if e.code in (429, 500, 502, 503, 504):
+                        import time as _t
+                        _t.sleep(2 + attempt * 3)
+                        continue
+                    break
+                except Exception:  # noqa: BLE001
+                    break
+            self.net.tool_done.emit(lambda r: cb(r), ("plain", text or None))
+        threading.Thread(target=work, daemon=True).start()
+
+    def can_hear(self):
+        return self.provider() == "gemini" or self.provider() in TRANSCRIBE_MODELS
+
+    def transcribe_then_ask(self, wav, on_reply, on_transcript):
+        """OpenAI/Groq: сначала распознаём речь отдельным сервисом, потом отправляем текст модели."""
+        p = self.provider()
+        base, key = PROVIDERS[p]["base"], self.key()
+
+        def work():
+            try:
+                text = transcribe(base, key, wav, TRANSCRIBE_MODELS[p])
+                err = None
+            except Exception as e:  # noqa: BLE001
+                text, err = "", e
+            self.net.tool_done.emit(lambda r: self._heard(r, on_reply, on_transcript), ("plain", (text, err)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _heard(self, res, on_reply, on_transcript):
+        text, err = res
+        if not text:
+            on_transcript("(не расслышал)")
+            on_reply(self._explain(err) if err else "Я ничего не расслышал. Попробуй ещё раз.")
+            return
+        on_transcript(text)
+        self.ask(text, on_reply)
 
     def ask_voice(self, wav, on_reply, on_transcript=None):
         import base64
@@ -468,9 +633,12 @@ class Agent:
     def effort(self):
         """Уровень размышлений для облака: у Gemini 2.5 Flash можно выключить совсем,
         у новых моделей — только снизить до low. Если сервер отверг параметр, больше не шлём."""
-        if getattr(self, "no_effort", False):
-            return None
+        ov = getattr(self, "effort_override", None)
+        if ov is not None:
+            return ov or None            # "" — значит, параметр не отправлять вовсе
         m = self.model().lower()
+        if self.provider() == "openai":
+            return "none"                # у OpenAI инструменты в chat/completions работают только без размышлений
         if self.provider() == "gemini" and "2.5" in m and "flash" in m:
             return "none"
         return "low"
@@ -482,7 +650,18 @@ class Agent:
         return self.w.cfg.get("ollama_url", "http://127.0.0.1:11434").rstrip("/") + path
 
     def system(self):
-        s = SYSTEM.format(addr=self.w.cfg["address"])
+        s = self.persona().format(addr=self.w.cfg["address"])
+        import ipc
+        here = [n for c, n in NAMES.items() if c != me().id and ipc.installed(c)]
+        s += ("\nИз друзей на этом компьютере есть: " + ", ".join(here) + ". Звать можно только их."
+              if here else "\nДругих персонажей на этом компьютере нет: звать некого, не предлагай этого.")
+        mem = self.w.cfg.get("memories") or []
+        if mem:
+            s += "\nЧто ты знаешь о пользователе (используй естественно, не перечисляй без повода):\n" + \
+                 "\n".join("- " + m for m in mem[-40:])
+        lvl = self.w.affection_level()[1] if hasattr(self.w, "affection_level") else ""
+        if lvl:
+            s += f"\nВаша близость сейчас: «{lvl}». Чем она выше, тем теплее и откровеннее ты говоришь."
         if self.local() and "qwen" in self.model().lower():
             s += "\n/no_think"          # «мягкий» выключатель размышлений у Qwen3
         return s
@@ -498,6 +677,9 @@ class Agent:
                                             for c in m["tool_calls"]]})
             elif m["role"] == "tool":
                 msgs.append({"role": "tool", "tool_name": m.get("tool_name", ""), "content": m["content"]})
+            elif m.get("image"):
+                msgs.append({"role": "user", "content": m.get("content") or "Вот что у меня на экране.",
+                             "images": [m["image"]]})
             else:
                 msgs.append({"role": m["role"], "content": m["content"]})
         if self.nudge:
@@ -527,6 +709,10 @@ class Agent:
                 msgs.append({"role": "assistant", "content": m.get("content") or None, "tool_calls": tcs})
             elif m["role"] == "tool":
                 msgs.append({"role": "tool", "tool_call_id": m.get("tool_call_id", ""), "content": m["content"]})
+            elif m.get("image"):
+                msgs.append({"role": "user", "content": [
+                    {"type": "text", "text": m.get("content") or "Вот что у меня на экране."},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + m["image"]}}]})
             elif m.get("audio"):
                 msgs.append({"role": "user", "content": [
                     {"type": "text", "text": self.VOICE_NOTE},
@@ -538,7 +724,7 @@ class Agent:
     def body(self, messages, **opts):
         o = {"temperature": 0.6, "num_ctx": 3072, "num_predict": 160}
         o.update(opts)
-        return {"model": self.model(), "messages": messages, "tools": TOOLS,
+        return {"model": self.model(), "messages": messages, "tools": self.tools(),
                 "stream": False, "think": False, "keep_alive": "60m", "options": o}
 
     def warmup(self):
@@ -569,7 +755,7 @@ class Agent:
                 QTimer.singleShot(0, lambda: self.net.done.emit(None, MissingKey()))
                 return
             url = p["base"] + "/chat/completions"
-            body = {"model": self.model(), "messages": self.openai_messages(), "tools": TOOLS,
+            body = {"model": self.model(), "messages": self.openai_messages(), "tools": self.tools(),
                     "temperature": 0.8}
             effort = self.effort()
             if effort:
@@ -618,11 +804,16 @@ class Agent:
 
     def _on_http(self, data, err):
         if (err is not None and isinstance(err, urllib.error.HTTPError) and err.code == 400
-                and "reasoning" in getattr(err, "detail", "").lower() and not getattr(self, "no_effort", False)):
-            self.no_effort = True
-            self.rounds -= 1
-            self._request()
-            return
+                and "reasoning" in getattr(err, "detail", "").lower()):
+            # сервер не принял уровень размышлений — пробуем следующий: low → none → без параметра
+            ladder = ["low", "none", ""]
+            cur = self.effort() or ""
+            nxt = ladder[ladder.index(cur) + 1] if cur in ladder and ladder.index(cur) < 2 else None
+            if nxt is not None:
+                self.effort_override = nxt     # запоминаем: дальше сразу работаем с подходящим уровнем
+                self.rounds -= 1
+                self._request()
+                return
         if err is not None and self._should_retry(err):
             return
         if err is not None:
@@ -735,6 +926,12 @@ class Agent:
 
     def _run_tools(self, calls, i):
         if i >= len(calls):
+            img = getattr(self, "pending_image", None)
+            if img:
+                self.pending_image = None
+                self.history.append({"role": "user", "content": "Вот снимок моего экрана.", "image": img})
+                self._request()
+                return
             if self.local() or self.rounds > 4:
                 self._finish_fast()     # маленькой модели второй вызов не нужен — отвечаем сразу
             else:
@@ -755,7 +952,7 @@ class Agent:
                                  "content": str(result)})
             self._run_tools(calls, i + 1)
 
-        handler = getattr(self, "t_" + name, None)
+        handler = getattr(self, "t_" + name, None) or getattr(getattr(self.w, "extra", None), "t_" + name, None)
         if handler is None:
             done(f"Нет такого инструмента: {name}")
             return
@@ -857,6 +1054,7 @@ class Agent:
         n = int(a.get("number", 0)) - 1
         if 0 <= n < len(ts):
             ts[n]["done"] = True
+            self.w.reward("todo")
             self.w.cfg.save()
             self.w.swarm.burst(self.w.hua.center().x(), self.w.hua.center().y(), n=4, radius=80)
             done(f"Выполнено: {ts[n]['text']}")
@@ -978,7 +1176,9 @@ class Agent:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_tool_bg(self, done, res):
-        if isinstance(res, tuple) and res and res[0] == "app":
+        if isinstance(res, tuple) and res and res[0] == "plain":
+            done(res[1])
+        elif isinstance(res, tuple) and res and res[0] == "app":
             self._app_found(done, res[1], res[2])
         else:
             self._found(done, res)
@@ -1044,6 +1244,257 @@ class Agent:
                 res = res.replace("Напоминание поставлено", "Будильник заведён")
             done(res)
         self.t_set_reminder(a, ok)
+
+    # ── инструменты: друзья, кино, презентации ──
+    def t_call_friend(self, a, done):
+        import ipc
+        who = a.get("who")
+        if who not in NAMES or who == me().id:
+            done("Некого звать.")
+            return
+        if not ipc.installed(who) and not ipc.is_running(who):
+            done(f"{NAMES[who]} на этом компьютере не установлен — позвать некого.")
+            return
+        if ipc.is_running(who):
+            s = ipc.connect(who)
+            ipc.send(s, {"cmd": "summon"})
+            s.waitForBytesWritten(300)
+            done(f"{NAMES[who]} уже здесь — позвал его поближе.")
+        else:
+            ipc.launch(who)
+            done(f"Позвал: {NAMES[who]} появится через несколько секунд.")
+
+    def t_pick_movies(self, a, done):
+        import evening
+        from urllib.parse import quote
+        g = a.get("genre") or "any"
+        pool = evening.JACKIE if g == "jackie" else evening.WUXIA if g == "wuxia" else None
+        seen = self.w.cfg.get("films_seen", [])
+        if pool:
+            fresh = [f for f in pool if f not in seen] or pool
+            picks = random.sample(fresh, 3)
+        else:
+            j = [f for f in evening.JACKIE if f not in seen] or evening.JACKIE
+            x = [f for f in evening.WUXIA if f not in seen] or evening.WUXIA
+            picks = [random.choice(j), random.choice(x)]
+            picks.append(random.choice([f for f in j + x if f not in picks]))
+        self.w.cfg["films_seen"] = (seen + picks)[-24:]
+        self.w.cfg["films_last"] = picks
+        self.w.cfg.save()
+        q = self.w.cfg.get("film_query", "{title} смотреть онлайн")
+        for f in picks:
+            open_url("https://www.google.com/search?q=" + quote(q.format(title=f)))
+        done("Выбраны и открыты во вкладках: " + "; ".join(picks))
+
+    def t_make_presentation(self, a, done):
+        topic = (a.get("topic") or "").strip()
+        if not topic:
+            done("Не указана тема.")
+            return
+        n = max(3, min(int(a.get("slides") or 7), 20))
+        src = (a.get("source") or "").strip()
+        if not src and re.search(r"\.(docx|pptx|pdf|txt|md)\b|[A-Za-z]:\\\\", topic, re.I):
+            src = topic                              # модель положила имя файла в тему
+        if not src:
+            self._presentation(a, topic, n, "", None, done)
+            return
+        self.status("Ищу и читаю документ…")
+
+        def work():                                  # поиск и чтение — не в потоке интерфейса
+            path = tools_pc.resolve_file(src)
+            if not path:
+                res = (None, f"Не нашёл документ «{src}». Нужен точный путь к файлу (.docx, .pdf, .pptx, .txt) или к папке с ним.")
+            else:
+                try:
+                    text = tools_pc.read_text(path)
+                    res = ((path, text), None) if len(text) >= 200 else \
+                        (None, f"В файле «{os.path.basename(path)}» почти нет текста — презентацию делать не из чего.")
+                except Exception as e:  # noqa: BLE001
+                    res = (None, f"Не смог прочитать «{os.path.basename(path)}»: {e}")
+            self.net.tool_done.emit(lambda r: done(r[1]) if r[1] else self._presentation(a, topic, n, r[0][1], r[0][0], done),
+                                    ("plain", res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _presentation(self, a, topic, n, source_text, path, done):
+        prompt = ((f"Составь презентацию по тексту документа ниже (тема: «{topic}»). Опирайся ТОЛЬКО на этот текст: "
+                   f"передай его структуру, главные тезисы, данные и выводы; ничего не выдумывай. "
+                   f"Заголовок презентации — по содержанию документа, а не по имени файла. "
+                   if source_text else f"Составь презентацию на тему «{topic}». ") +
+                  f"Слайдов с содержанием: {n}. "
+                  f"Пожелания: {a.get('details') or 'нет'}.\n"
+                  "На каждом слайде 3–5 коротких содержательных тезисов (без воды) и заметки докладчика в 1–2 предложения. "
+                  "Последний слайд — выводы.\nВерни ТОЛЬКО JSON вида:\n"
+                  '{"title": "...", "subtitle": "...", "slides": [{"title": "...", "bullets": ["..."], "notes": "..."}]}')
+        if source_text:
+            if self.local():
+                source_text = source_text[:12000]    # локальная модель больше не вместит
+            prompt += "\n\n=== ТЕКСТ ДОКУМЕНТА ===\n" + source_text
+        system = "Ты составляешь содержательные презентации на русском языке. Отвечай только корректным JSON, без пояснений."
+        self.w.talk(text=(f"Читаю «{os.path.basename(path)}» и составляю слайды. Это минута-две." if path
+                          else "Готовлю презентацию. Подожди."))
+        self.status("Составляю слайды — это минута-две…")
+
+        def got(text):
+            import slides
+            if not text:
+                done("Модель не ответила (сбой сети, лимит или слишком долгий ответ). Презентация не создана — можно повторить.")
+                return
+            o = slides.parse_outline(text)
+            if not o:
+                done("Не получилось составить план: модель ответила не по форме. Можно попробовать ещё раз.")
+                return
+            try:
+                docs = tools_pc.known_folders().get("Документы") or tools_pc.home()
+                path = slides.build(o, os.path.join(docs, "Презентации"))
+            except Exception as e:  # noqa: BLE001
+                done(f"Не удалось создать файл презентации: {e}")
+                return
+            if os.name == "nt":
+                try:
+                    os.startfile(path)  # noqa: S606
+                except OSError:
+                    tools_pc.reveal(path)
+            done(f"Презентация готова: {len(o['slides'])} слайдов, файл «{path}». Открыта для просмотра.")
+        self.one_shot(prompt, got, system=system, long=True)
+
+    def t_read_file(self, a, done):
+        name = (a.get("file") or "").strip()
+
+        def work():
+            path = tools_pc.resolve_file(name)
+            if not path:
+                res = f"Не нашёл файл «{name}»."
+            else:
+                try:
+                    res = f"Файл «{path}»:\n" + tools_pc.read_text(path, limit=12000)
+                except Exception as e:  # noqa: BLE001
+                    res = f"Не смог прочитать «{os.path.basename(path)}»: {e}"
+            self.net.tool_done.emit(done, ("plain", res))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── инструменты: экран ──
+    def t_look_at_screen(self, a, done):
+        import features
+        self.w.hide_chat_briefly()
+        from PySide6.QtCore import QTimer as _T
+
+        def shoot():
+            try:
+                img = features.screenshot_jpeg_b64()
+            except Exception as e:  # noqa: BLE001
+                self.w.show_chat_again()
+                done(f"Не получилось сделать снимок: {e}")
+                return
+            self.w.show_chat_again()
+            self.pending_image = img
+            done("Снимок экрана сделан, он в следующем сообщении.")
+        _T.singleShot(250, shoot)
+
+    # ── инструменты: память ──
+    def t_remember(self, a, done):
+        f = (a.get("fact") or "").strip()
+        if not f:
+            done("Пустой факт.")
+            return
+        mem = self.w.cfg.setdefault("memories", [])
+        if f not in mem:
+            mem.append(f)
+            self.w.cfg.save()
+        done(f"Запомнил: {f}")
+
+    def t_list_memories(self, a, done):
+        mem = self.w.cfg.get("memories") or []
+        dates = self.w.cfg.get("dates") or []
+        lines = [f"{i + 1}. {m}" for i, m in enumerate(mem)]
+        lines += [f"• {d['date']} — {d['what']}" for d in dates]
+        done("\n".join(lines) if lines else "Пока ничего особенного не запомнил.")
+
+    def t_forget(self, a, done):
+        mem = self.w.cfg.get("memories") or []
+        n = int(a.get("number", 0)) - 1
+        if 0 <= n < len(mem):
+            f = mem.pop(n)
+            self.w.cfg.save()
+            done(f"Забыл: {f}")
+        else:
+            done("Нет факта с таким номером.")
+
+    def t_remember_date(self, a, done):
+        m = re.search(r"(\d{1,2})[./ -](\d{1,2})", str(a.get("date", "")))
+        if not m:
+            done("Дата должна быть в формате ДД.ММ.")
+            return
+        d = f"{int(m.group(1)):02d}.{int(m.group(2)):02d}"
+        what = (a.get("what") or "").strip() or "важный день"
+        if a.get("who_is_user"):
+            self.w.cfg["birthday"] = d
+        else:
+            self.w.cfg.setdefault("dates", []).append({"date": d, "what": what})
+        self.w.cfg.save()
+        done(f"Запомнил дату {d}: {what}. Напомню накануне и в сам день.")
+
+    # ── инструменты: погода, музыка, таймер ──
+    def t_set_city(self, a, done):
+        self.w.cfg["city"] = (a.get("city") or "").strip()
+        self.w.cfg.save()
+        done(f"Запомнил город: {self.w.cfg['city']}")
+
+    def t_get_weather(self, a, done):
+        import features
+        city = (a.get("city") or self.w.cfg.get("city") or "").strip()
+        if not city:
+            done("Город не известен — спроси, в каком городе пользователь, и вызови set_city.")
+            return
+
+        def work():
+            try:
+                res = features.weather(city)
+            except Exception as e:  # noqa: BLE001
+                res = f"Не удалось узнать погоду: {e}"
+            self.net.tool_done.emit(done, ("plain", res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def t_media_control(self, a, done):
+        import features
+        act = a.get("action", "play_pause")
+        ok = features.media(act, a.get("steps") or (5 if "volume" in act else 1))
+        done("Готово." if ok else "Управление музыкой работает только в Windows.")
+
+    def t_start_timer(self, a, done):
+        mins = float(a.get("minutes") or 0)
+        if mins <= 0:
+            done("Не указано, на сколько минут.")
+            return
+        label = (a.get("label") or "Таймер").strip()
+        self.w.add_timer(mins, label)
+        done(f"Таймер «{label}» на {mins:g} мин запущен.")
+
+    def t_screen_time(self, a, done):
+        done(self.w.screen_time.report(a.get("date")))
+
+    # ── инструменты: дневник и монеты ──
+    def t_write_diary(self, a, done):
+        t = (a.get("text") or "").strip()
+        day = datetime.date.today().isoformat()
+        diary = self.w.cfg.setdefault("diary", {})
+        diary[day] = (diary.get(day, "") + " " + t).strip()
+        self.w.cfg.save()
+        self.w.reward("diary")
+        done("Записал в дневник.")
+
+    def t_read_diary(self, a, done):
+        days = int(a.get("days") or 7)
+        diary = self.w.cfg.get("diary") or {}
+        keys = sorted(diary)[-days:]
+        done("\n".join(f"{k}: {diary[k]}" for k in keys) if keys else "Дневник пока пуст.")
+
+    def t_coins(self, a, done):
+        import features
+        c = self.w.cfg.get("coins", 0)
+        owned = set(self.w.cfg.get("owned", []))
+        shop = "; ".join(f"{name} — {price}" + (" (куплено)" if key in owned else "")
+                         for key, name, price, _ in features.SHOP)
+        done(f"Монет: {c}. В лавке: {shop}. Купить можно в меню «Лавка Призрачного города».")
 
     # ── инструменты: браузер ──
     def t_open_website(self, a, done):

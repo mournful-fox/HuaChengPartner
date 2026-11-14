@@ -1,11 +1,15 @@
-// Подключается к программе Хуа Чена на этом же компьютере (ws://127.0.0.1:47321).
-// Умеет только две вещи: показать список вкладок и закрыть выбранные.
-const URL = "ws://127.0.0.1:47321";
-let ws = null;
+// Подключается к персонажам на этом же компьютере: у каждого свой порт
+// (47321 — Хуа Чен, 47322 — Вэй Усянь, 47323 — Лань Чжань).
+// Умеет: показать список вкладок, закрыть выбранные, сообщить, какой сайт открылся.
+const PORTS = [47321, 47322, 47323];
+const sockets = {};
 
-function connect() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  try { ws = new WebSocket(URL); } catch (e) { return; }
+function connect(port) {
+  const cur = sockets[port];
+  if (cur && (cur.readyState === WebSocket.OPEN || cur.readyState === WebSocket.CONNECTING)) return;
+  let ws;
+  try { ws = new WebSocket("ws://127.0.0.1:" + port); } catch (e) { return; }
+  sockets[port] = ws;
   ws.onmessage = async (ev) => {
     let m;
     try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -23,14 +27,20 @@ function connect() {
       ws.send(JSON.stringify({ id: m.id, error: String(e) }));
     }
   };
-  ws.onclose = () => { ws = null; };
+  ws.onclose = () => { if (sockets[port] === ws) delete sockets[port]; };
   ws.onerror = () => {};
 }
 
-// держим связь живой: пинг каждые 20 с, а будильник раз в 30 с переподключает, если программа перезапускалась
-setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send('{"ping":1}'); else connect(); }, 20000);
+function connectAll() { PORTS.forEach(connect); }
+function each(fn) { Object.values(sockets).forEach(ws => { if (ws.readyState === WebSocket.OPEN) fn(ws); }); }
+
+setInterval(() => { each(ws => ws.send('{"ping":1}')); connectAll(); }, 20000);
 chrome.alarms.create("hua-keepalive", { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(connect);
-chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
-connect();
+chrome.alarms.onAlarm.addListener(connectAll);
+chrome.runtime.onStartup.addListener(connectAll);
+chrome.runtime.onInstalled.addListener(connectAll);
+connectAll();
+
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.url) each(ws => ws.send(JSON.stringify({ event: "tab", tabId, url: info.url })));
+});

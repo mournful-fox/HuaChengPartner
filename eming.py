@@ -96,8 +96,13 @@ class EMingWindow(QWidget):
         floor = w.floor_y() - self.thickness()
         cur = QCursor.pos()
 
-        if self.state not in ("return", "drag", "sheathed") and w.now > self.out_until:
+        if self.state not in ("return", "drag", "sheathed", "fetch", "bring") and w.now > self.out_until:
             self.recall()
+        if self.state in ("fetch", "bring") and getattr(self, "ball", None):
+            self.step_fetch(dt)
+            self.move(int(self.x - self.S / 2), int(self.y - self.S / 2))
+            self.update()
+            return
 
         if self.state in ("jump", "fall"):
             self.vy += GRAV * dt
@@ -198,6 +203,65 @@ class EMingWindow(QWidget):
         else:             # повилять рукоятью на месте
             self.wagging = True
             self.timer = random.uniform(1.5, 3)
+
+    # ── игра в мяч ──
+    def fetch(self, ball):
+        """Мяч брошен — бежим за ним."""
+        if self.state == "sheathed":
+            self.release()
+        self.ball = ball
+        self.state = "fetch"
+        self.out_until = self.w.now + 240
+
+    def fetch_release(self):
+        if getattr(self, "ball", None) and self.ball.carried:
+            self.ball.carried = False
+        if self.state in ("fetch", "bring"):
+            self.state = "ground"
+            self.land()
+
+    def fetch_done(self):
+        self.ball = None
+        if self.state in ("fetch", "bring"):
+            self.state = "fall"
+
+    def step_fetch(self, dt):
+        b = self.ball
+        if self.state == "fetch":
+            if b.held:
+                return
+            tx, ty, sp = b.x, b.y, 650
+        else:
+            cur = QCursor.pos()
+            tx, ty, sp = cur.x() + 40, cur.y() + 40, 500
+        dx, dy = tx - self.x, ty - self.y
+        d = math.hypot(dx, dy) or 1e-3
+        want = sp * min(1, d / 60)
+        self.vx += (dx / d * want - self.vx) * min(1, dt * 6)
+        self.vy += (dy / d * want - self.vy) * min(1, dt * 6)
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        if math.hypot(self.vx, self.vy) > 40:
+            target = math.degrees(math.atan2(self.vy, self.vx))
+            diff = (target - self.angle + 540) % 360 - 180
+            self.angle += diff * min(1, dt * 8)
+        if self.state == "fetch" and d < 26:
+            b.carried = True
+            self.state = "bring"
+            self.w.bubble(self.bubble_anchor, text="*схватил мяч!*", owner="eming")
+            return                      # нести начнём со следующего кадра — расстояние уже до курсора
+        if self.state == "bring":
+            b.x = self.x + math.cos(math.radians(self.angle)) * self.L * 0.4
+            b.y = self.y + math.sin(math.radians(self.angle)) * self.L * 0.4
+            if d < 30:
+                b.carried = False
+                b.vx, b.vy = random.uniform(-60, 60), -120
+                self.state = "ground"
+                self.land()
+                self.wagging = True
+                self.timer = 2.5
+                self.w.bubble(self.bubble_anchor, text=random.choice(["*виляет рукоятью*", "*ещё! ещё!*",
+                                                                     "*гордо звякнул*"]), owner="eming")
 
     def sheathe(self):
         self.state = "sheathed"

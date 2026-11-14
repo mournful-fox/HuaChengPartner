@@ -14,7 +14,12 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
                                QSpinBox, QSystemTrayIcon)
 
+import ipc
+import phrases
+from characters import NAMES, detect, me, set_current
 from config import Config
+from evening import EveningMixin
+from life import LifeMixin
 import effects
 from effects import (Bubble, ButterflySprite, CrimsonRain, DiceRoll, Overlay, Particles,
                      RedString, Slash, Swarm)
@@ -32,18 +37,28 @@ def base_dir():
     return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 
 
-class World:
+class World(LifeMixin, EveningMixin):
     def __init__(self, app):
         self.app = app
-        self.cfg = Config.load()
+        self.char = me()
+        self.cfg = Config.load(self.char.id)
+        if self.char.phrases:
+            phrases.PHRASES = self.char.phrases
+        phrases.PHRASES.setdefault("wake", ["Мм… Я не спал. Просто прикрыл глаз."])
+        if not self.char.butterflies:
+            self.cfg["butterflies"] = 0
+            self.cfg["red_string"] = False
+        self.remote, self.remote_t, self.remote_seen = None, 0.0, False
+        self.extra = None
         scr = QGuiApplication.primaryScreen()
         self.screen_geo = scr.geometry()
         self.avail = scr.availableGeometry()
         self.now = 0.0
         self.hua = None
         import json
-        with open(self.asset("poses.json"), encoding="utf-8") as f:
-            effects.SPRITE = ButterflySprite(self.asset("butterfly.png"), json.load(f)["butterfly"]["body"])
+        if os.path.exists(self.asset("butterfly.png")):
+            with open(self.asset("poses.json"), encoding="utf-8") as f:
+                effects.SPRITE = ButterflySprite(self.asset("butterfly.png"), json.load(f)["butterfly"]["body"])
         self.overlay = Overlay(self)
         self.hua = HuaWindow(self)
         self.eming = EMingWindow(self)
@@ -57,11 +72,12 @@ class World:
         self.next_speech = self.schedule_speech(first=True)
         self.last_hour_talk = None
 
-        self.icon = make_icon(self.asset("butterfly.png"))
+        self.icon = (QIcon(self.asset("icon.png")) if os.path.exists(self.asset("icon.png"))
+                     else make_icon(self.asset("butterfly.png")))
         app.setWindowIcon(self.icon)
         self.build_menu()
         self.tray = QSystemTrayIcon(self.icon)
-        self.tray.setToolTip("Хуа Чен")
+        self.tray.setToolTip(self.char.name)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.on_tray)
         self.tray.show()
@@ -87,7 +103,8 @@ class World:
         self.fs_timer.timeout.connect(self.check_fullscreen)
         self.fs_timer.start(1500)
         self.hotkey = install_hotkey(app, {0x4843: self.toggle_hidden, 0x4844: self.open_chat,
-                                           0x4845: self.toggle_voice})
+                                           0x4845: self.toggle_voice, 0x4846: self.look_screen,
+                                           0x4847: self.clipboard_action})
         import tools_pc
         self.tools_pc = tools_pc
         self.recorder = tools_pc.Recorder()
@@ -102,11 +119,25 @@ class World:
         self.thinking = False
         self.last_rem_check = 0.0
         QTimer.singleShot(4000, self.agent.warmup)   # заранее загрузить модель в память
+        self.setup_life()
+        if self.char.module:                     # личный модуль персонажа: его эффекты, занятия и умения
+            import importlib
+            self.extra = importlib.import_module(self.char.module).Extra(self)
+            self.build_menu()
+            self.tray.setContextMenu(self.menu)
+        self.setup_evening()
+        self.ev_timer = QTimer()
+        self.ev_timer.timeout.connect(lambda: self.char.id == "hua" and not self.char.guest
+                                      and (self.check_evening(), self.check_lan()))
+        self.link = ipc.Link(self, self.char.id)
+        if self.char.guest:                      # нас позвали в гости: ждём указаний хозяина сцены
+            self.remote = {"x": self.avail.right() + 600, "op": 0.0, "pose": "idle"}
+        self.ev_timer.start(20000)
         # прописываемся в автозапуск при каждом старте (на случай, если .exe переложили в другую папку)
         set_autostart(self.cfg["autostart"])
 
-        QTimer.singleShot(1500, lambda: self.bubble(
-            self.hua_anchor, text=greeting(self.cfg["address"], self.cfg.days_together())))
+        if not self.char.guest:
+            QTimer.singleShot(1500, lambda: self.talk(text=self.greet_text()))
 
     # ── утилиты ──
     def asset(self, name):
@@ -135,7 +166,9 @@ class World:
         """Прячется, пока открыта полноэкранная игра или видео."""
         if not self.cfg.get("hide_fullscreen", True) or self.hidden and not self.fs_hidden:
             return
-        fs = foreground_is_fullscreen(self.screen_geo)
+        fs = foreground_is_fullscreen(self.screen_geo) and not self.cards
+        self.fs_hits = (getattr(self, "fs_hits", 0) + 1) if fs else 0
+        fs = self.fs_hits >= 2                      # две проверки подряд — не реагируем на мелькание
         if fs and not self.hidden:
             self.fs_hidden = True
             self.toggle_hidden()
@@ -157,6 +190,8 @@ class World:
     # ── главный цикл ──
     def tick(self):
         ms = self.clock.elapsed()
+        if self.remote and ms / 1000.0 - self.remote_t > (4 if self.remote_seen else 90):
+            self.release_remote()                # хозяин сцены пропал
         dt = min(0.05, (ms - self.last_ms) / 1000.0)
         self.last_ms = ms
         self.now = ms / 1000.0
@@ -165,6 +200,10 @@ class World:
         self.hua.step(dt)
         self.eming.step(dt)
         self.swarm.step(dt)
+        self.life_tick(dt)
+        if self.extra:
+            self.extra.tick(dt)
+        self.evening_tick(dt)
         self.effects = [fx for fx in self.effects if fx.step(dt)]
         self.bubbles = [b for b in self.bubbles if b.step(dt)]
         if self.cfg["red_string"]:
@@ -183,6 +222,9 @@ class World:
             rects += self.string.bounds()
         if self.focus_active():
             rects.append(self.focus_rect())
+        rects += self.life_rects()
+        if self.extra:
+            rects += self.extra.rects()
         return rects
 
     def draw_overlay(self, p):
@@ -191,6 +233,9 @@ class World:
         for fx in self.effects:
             fx.draw(p)
         self.swarm.draw(p)
+        self.draw_life(p)
+        if self.extra:
+            self.extra.draw(p)
         for b in self.bubbles:
             if b.anchor_fn == self.hua_anchor and not self.hua.visible_now():
                 continue  # пока он рассыпан на бабочек, облачко прячется
@@ -218,6 +263,9 @@ class World:
     def talk(self, kind=None, text=None):
         if not self.hua.isVisible():
             return
+        if self.ev or self.lz_state:                 # идёт сценка — реплика встаёт в общую очередь, чтобы не наложиться
+            self.enqueue(None, text if text is not None else say(kind, self.cfg["address"]), opt=True)
+            return
         self.bubble(self.hua_anchor, kind, text, owner="hua")
 
     def time_kind(self):
@@ -240,12 +288,13 @@ class World:
             self.bubble(self.hua_anchor, text="…", owner="think")
         if self.now > self.next_speech:
             self.next_speech = self.schedule_speech()
-            if not self.focus_active():
+            if not self.focus_active() and not self.remote and not self.ev and not self.lz_state:
                 tk = self.time_kind()
                 self.talk(tk if tk != "random" and random.random() < 0.45 else "random")
         if self.focus_until is not None and self.now > self.focus_until:
             self.focus_until = None
             self.break_until = self.now + 5 * 60
+            self.reward("focus")
             self.swarm.recall()
             # бабочка-вестник летит к курсору
             c = QCursor.pos()
@@ -253,7 +302,7 @@ class World:
             msg = self.swarm.spawn_temp(h.x(), h.y(), goal=(c.x() + 30, c.y() - 30), then="guard", maxs=420)
             msg.life = 5
             self.bubble(lambda: QPointF(msg.x, msg.y - 10), "focus_end", owner="hua")
-            self.tray.showMessage("Хуа Чен", "Перерыв! Пять минут отдыха.", self.icon, 4000)
+            self.tray.showMessage(self.char.name + "", "Перерыв! Пять минут отдыха.", self.icon, 4000)
             self.update_focus_action()
         if self.break_until is not None and self.now > self.break_until:
             self.break_until = None
@@ -330,13 +379,13 @@ class World:
         line = f"{addr[:1].upper() + addr[1:]}, напоминаю: {text}"
         self.bubbles = [b for b in self.bubbles if b.owner != "hua"]
         self.bubbles.append(Bubble(lambda: QPointF(msg.x, msg.y - 10), line, "hua", duration=12))
-        self.tray.showMessage("Хуа Чен напоминает", text, self.icon, 10000)
+        self.tray.showMessage(self.char.name + " напоминает", text, self.icon, 10000)
 
     # ── голос ──
     def toggle_voice(self):
         if self.hidden:
             self.toggle_hidden()
-        if self.agent.provider() != "gemini":
+        if not self.agent.can_hear():
             # модель не понимает аудио — включаем голосовой ввод Windows прямо в поле чата
             self.open_chat()
             QTimer.singleShot(400, self.tools_pc.press_win_h)
@@ -383,7 +432,7 @@ class World:
         self.swarm.release(30)
         addr = self.cfg["address"]
         self.talk(text=f"{addr[:1].upper() + addr[1:]}, пора! {text}")
-        self.tray.showMessage("Хуа Чен: будильник", text, self.icon, 10000)
+        self.tray.showMessage(self.char.name + ": будильник", text, self.icon, 10000)
         if self.alarm_card:
             self.alarm_card.close()
 
@@ -482,7 +531,7 @@ class World:
         left = max(0, int(self.focus_until - self.now))
         r = self.focus_rect()
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(45, 10, 16, 200))
+        p.setBrush(QColor(*self.char.theme.get("badge", (45, 10, 16, 200))))
         p.drawRoundedRect(r.adjusted(14, 4, -14, -4), 8, 8)
         p.setPen(QColor(235, 240, 250))
         p.drawText(r, Qt.AlignCenter, f"⌛ {left // 60:02d}:{left % 60:02d}")
@@ -505,6 +554,8 @@ class World:
         self.menu = m
         m.addAction("Написать ему…  (Ctrl+Alt+Space)", self.open_chat)
         m.addAction("Сказать голосом  (Ctrl+Alt+V)", self.toggle_voice)
+        m.addAction("Посмотри на экран  (Ctrl+Alt+S)", self.look_screen)
+        m.addAction("Текст из буфера…  (Ctrl+Alt+C)", self.clipboard_action)
         m.addAction("Поговори со мной", lambda: self.talk(random.choice(["random", self.time_kind()])))
 
         bm = m.addMenu("Бабочки")
@@ -526,6 +577,30 @@ class World:
         dm.addAction("Спросить: да или нет?", lambda: self.roll_dice(True))
 
         m.addAction("Кровавый дождь", self.crimson_rain)
+        fun = m.addMenu("Призрачный город")
+        fun.addAction("Лавка…", self.open_shop)
+        fun.addAction("Кости на монеты…", self.dice_bet)
+        fun.addAction("Поиграть с Э-Мином в мяч", self.play_ball)
+        fun.addAction("Запустить фонарики", self.launch_lanterns)
+        ev = m.addMenu("Гости")
+        ev.addAction("Позвать Вэй Усяня (вечер кино)", self.start_evening)
+        ev.addAction("Позвать Лань Чжаня", self.lan_visit)
+        ev.addAction("Отпустить гостей", self.end_evening)
+        for key, label in (("evening_enabled", "Вэй Усянь приходит вечером сам"),
+                           ("lan_enabled", "Лань Чжань приходит по расписанию")):
+            act = QAction(label, m, checkable=True)
+            act.setChecked(self.cfg.get(key, True))
+            act.toggled.connect(lambda v, key=key: self.cfg.__setitem__(key, v))
+            ev.addAction(act)
+        life = m.addMenu("Дневник и письма")
+        life.addAction("Утренняя сводка", self.morning_summary)
+        life.addAction("Рассказать, как прошёл день", self.ask_diary)
+        life.addAction("Последнее письмо", self.show_last_letter)
+        life.addAction("Попросить написать письмо", lambda: self.write_letter(manual=True))
+        self.a_guard = QAction("Бабочки-стражи во время фокуса", m, checkable=True)
+        self.a_guard.setChecked(self.cfg.get("focus_guard", True))
+        self.a_guard.toggled.connect(lambda v: self.cfg.__setitem__("focus_guard", v))
+        m.addAction(self.a_guard)
         self.a_string = QAction("Красная нить", m, checkable=True)
         self.a_string.setChecked(self.cfg["red_string"])
         self.a_string.toggled.connect(lambda v: self.cfg.__setitem__("red_string", v))
@@ -555,6 +630,7 @@ class World:
         m.addAction("Настройки…", self.show_settings)
         m.addSeparator()
         m.addAction("Выход", self.quit)
+        self.adapt_menu()
 
     def show_menu(self, pos):
         self.menu.popup(pos)
@@ -605,16 +681,26 @@ class World:
             self.eming.hide()
         elif self.eming.state != "sheathed":
             self.eming.show()
+        for g in (self.wwx, self.lz):
+            if g and (self.hidden or g.opacity > 0):
+                g.setVisible(not self.hidden)
         self.a_hide.setText("Показать  (Ctrl+Alt+H)" if self.hidden else "Спрятать  (Ctrl+Alt+H)")
+
+    def data_dir(self):
+        return os.path.dirname(self.cfg.path)
 
     def show_stats(self):
         c = self.cfg
         text = (f"Вместе: {plural_days(c.days_together())}\n"
                 f"Погладили: {c['pets']} раз\n"
                 f"Телепортов: {c['teleports']}\n"
-                f"Бросков костей: {c['dice']}")
-        self.tray.showMessage("Хуа Чен — статистика", text, self.icon, 6000)
-        self.talk(text=f"Ты гладишь меня уже {c['pets']} раз. Я считаю.")
+                f"Бросков костей: {c['dice']}\n"
+                f"Монет: {c.get('coins', 0)} · близость: {self.affection_level()[1]} ({self.affection_level()[0]})")
+        if self.extra:
+            text = self.extra.stats()
+        self.tray.showMessage(self.char.name + " — статистика", text, self.icon, 6000)
+        if not self.extra:
+            self.talk(text=f"Ты гладишь меня уже {c['pets']} раз. Я считаю.")
 
     def show_settings(self):
         dlg = SettingsDialog(self.cfg)
@@ -633,7 +719,90 @@ class World:
             self.next_speech = self.schedule_speech()
             self.cfg.save()
             self.agent.reset()
+            self.agent.effort_override = None   # новая модель — подбираем уровень размышлений заново
             self.agent.warmup()
+
+    # ── несколько персонажей ──
+    def adapt_menu(self):
+        """Прячет пункты, которые есть только у Хуа Чена, и добавляет «Позвать друга»."""
+        m = self.menu
+        for a in m.actions():
+            if a.text() in self.char.menu_hide:
+                a.setVisible(False)
+        if self.extra:
+            self.extra.menu(m)
+        self.friends_menu = QMenu("Позвать друга")
+        self.friends_menu.aboutToShow.connect(self.fill_friends)
+        self.friends_action = m.insertMenu(m.actions()[-1], self.friends_menu)
+        m.aboutToShow.connect(self.update_friends)
+        self.update_friends()
+
+    def friends(self):
+        """Другие персонажи, установленные на этом компьютере."""
+        return [c for c in NAMES if c != self.char.id and ipc.installed(c)]
+
+    def update_friends(self):
+        fr = self.friends()
+        self.friends_action.setVisible(bool(fr))
+        for a in self.menu.actions():
+            if a.text() == "Гости":
+                a.setVisible(self.char.id == "hua" and bool(fr))
+
+    def fill_friends(self):
+        self.friends_menu.clear()
+        for cid in self.friends():
+            self.friends_menu.addAction(NAMES[cid], lambda cid=cid: self.agent.t_call_friend(
+                {"who": cid}, lambda r: self.talk(text=r)))
+
+    def do_banter(self):
+        """Иногда перекидывается репликой с другом, если тот тоже запущен."""
+        from characters import BANTER_ALL
+        QTimer.singleShot(int(random.uniform(40, 90) * 60000), self.do_banter)
+        if self.hidden or self.remote or self.ev or self.focus_active() or self.char.guest:
+            return
+        mine = BANTER_ALL.get(self.char.id, {})
+        for cid in random.sample(list(mine), len(mine)):
+            s = ipc.connect(cid, 100)
+            if s:
+                line, reply = random.choice(mine[cid])
+                self.talk(text=self.fmt(line))
+                ipc.send(s, {"cmd": "banter", "reply": reply})
+                s.waitForBytesWritten(300)
+                return
+
+    def on_remote(self, msg):
+        cmd = msg.get("cmd")
+        if cmd == "state":
+            self.remote, self.remote_t, self.remote_seen = msg, self.now, True
+        elif cmd == "say":
+            if msg.get("dur") and self.hua.isVisible():
+                self.bubbles = [b for b in self.bubbles if b.owner != "hua"]
+                self.bubbles.append(Bubble(self.hua_anchor, msg.get("text", ""), "hua", duration=float(msg["dur"])))
+            else:
+                self.talk(text=msg.get("text", ""))
+        elif cmd == "release":
+            self.release_remote()
+        elif cmd == "fx" and self.extra and hasattr(self.extra, "remote_fx"):
+            self.extra.remote_fx(msg.get("name"), msg)
+        elif cmd == "banter" and not self.remote and not self.hidden:
+            QTimer.singleShot(2500, lambda: self.talk(text=self.fmt(msg.get("reply", ""))))
+        elif cmd == "summon":
+            if self.hidden:
+                self.toggle_hidden()
+            self.hua.summon()
+
+    def release_remote(self):
+        self.remote = None
+        if self.char.guest:
+            QTimer.singleShot(400, self.quit)    # гость уходит домой
+        else:
+            self.hua.opacity = 1.0
+            self.hua.enter("idle")
+
+    def greet_text(self):
+        a = self.cfg["address"]
+        d = self.cfg.days_together()
+        return self.char.greet[0 if d <= 1 else 1].format(addr=a, Addr=a[:1].upper() + a[1:], days=plural_days(d))
 
     def quit(self):
         self.cfg.save()
@@ -645,7 +814,7 @@ class SettingsDialog(QDialog):
     def __init__(self, cfg):
         super().__init__(None, Qt.WindowStaysOnTopHint)
         self.cfg = cfg
-        self.setWindowTitle("Хуа Чен — настройки")
+        self.setWindowTitle(me().name + " — настройки")
         f = QFormLayout(self)
         self.addr = QComboBox()
         self.addr.setEditable(True)
@@ -663,7 +832,7 @@ class SettingsDialog(QDialog):
         for pid, p in PROVIDERS.items():
             self.prov.addItem(p["title"], pid)
         self.prov.setCurrentIndex(max(0, self.prov.findData(cfg.get("provider", "ollama"))))
-        f.addRow("Мозг Хуа Чена:", self.prov)
+        f.addRow("Мозг (модель ИИ):", self.prov)
         krow = QHBoxLayout()
         self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.Password)
@@ -706,6 +875,9 @@ class SettingsDialog(QDialog):
         self.auto.setEnabled(sys.platform == "win32")
         for cb in (self.string, self.follow, self.eauto, self.calm, self.fs, self.auto):
             f.addRow(cb)
+        if not me().butterflies:                 # настройки бабочек и Э-Мина — только у Хуа Чена
+            for wdg in (self.bf, self.walk, self.string, self.follow, self.eauto):
+                f.setRowVisible(wdg, False)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -778,7 +950,7 @@ class SettingsDialog(QDialog):
 
 
 def set_autostart(on):
-    if sys.platform != "win32":
+    if sys.platform != "win32" or me().guest:
         return
     try:
         _set_autostart(on)
@@ -788,19 +960,22 @@ def set_autostart(on):
 
 def _set_autostart(on):
     import winreg
+    cid = me().id
+    reg_name = APP if cid == "hua" else f"{APP}-{cid}"
+    extra = "" if cid == "hua" else f" --as {cid}"
     key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run",
                          0, winreg.KEY_SET_VALUE)
     try:
         if on:
             if getattr(sys, "frozen", False):
-                cmd = f'"{sys.executable}"'
+                cmd = f'"{sys.executable}"' + extra
             else:
                 pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                cmd = f'"{pyw}" "{os.path.abspath(__file__)}"'
-            winreg.SetValueEx(key, APP, 0, winreg.REG_SZ, cmd)
+                cmd = f'"{pyw}" "{os.path.abspath(__file__)}"' + extra
+            winreg.SetValueEx(key, reg_name, 0, winreg.REG_SZ, cmd)
         else:
             try:
-                winreg.DeleteValue(key, APP)
+                winreg.DeleteValue(key, reg_name)
             except FileNotFoundError:
                 pass
     finally:
@@ -834,7 +1009,12 @@ def foreground_is_fullscreen(screen):
         return False
     cls = ctypes.create_unicode_buffer(64)
     u.GetClassNameW(hwnd, cls, 64)
-    if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+    if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "#32769"):
+        return False
+    if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):
+        return False
+    style = u.GetWindowLongW(hwnd, -16)          # GWL_STYLE
+    if style & 0x00C00000 == 0x00C00000:         # есть заголовок — обычное (пусть и развёрнутое) окно
         return False
     pid = wintypes.DWORD()
     u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -861,6 +1041,8 @@ def ollama_models(cfg):
 
 def install_hotkey(app, callbacks):
     """Ctrl+Alt+H — спрятать/показать, Ctrl+Alt+Space — написать ему (только Windows)."""
+    if me().guest:
+        return None
     if sys.platform != "win32":
         return None
     import ctypes
@@ -883,6 +1065,8 @@ def install_hotkey(app, callbacks):
     ctypes.windll.user32.RegisterHotKey(None, 0x4843, 0x0001 | 0x0002 | 0x4000, ord("H"))
     ctypes.windll.user32.RegisterHotKey(None, 0x4844, 0x0001 | 0x0002 | 0x4000, 0x20)   # пробел
     ctypes.windll.user32.RegisterHotKey(None, 0x4845, 0x0001 | 0x0002 | 0x4000, ord("V"))
+    ctypes.windll.user32.RegisterHotKey(None, 0x4846, 0x0001 | 0x0002 | 0x4000, ord("S"))   # экран
+    ctypes.windll.user32.RegisterHotKey(None, 0x4847, 0x0001 | 0x0002 | 0x4000, ord("C"))   # буфер
     return f
 
 
@@ -891,7 +1075,17 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setQuitOnLastWindowClosed(False)
+    args = sys.argv[1:]
+    cid = detect(sys.argv)
+    set_current(cid, guest="--guest" in args)
+    if ipc.is_running(cid):                     # этот персонаж уже запущен — просто зовём его
+        s = ipc.connect(cid)
+        ipc.send(s, {"cmd": "summon"})
+        s.waitForBytesWritten(300)
+        return
     world = World(app)
+    ipc.register(cid)
+    QTimer.singleShot(int(random.uniform(10, 25) * 60000), world.do_banter)
     app.aboutToQuit.connect(world.cfg.save)
     sys.exit(app.exec())
 

@@ -12,7 +12,7 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QCursor, QPainter, QPixmap, QTransform
 from PySide6.QtWidgets import QWidget
 
-POSES = ["idle", "walk", "dice", "umbrella", "sleep", "pet", "scold"]
+POSES = ["idle", "walk", "dice", "umbrella", "sleep", "pet", "scold", "drink", "swing"]
 PAD = 22
 PAD_B = 4
 
@@ -26,9 +26,16 @@ class HuaWindow(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.NoFocus)
         self.setCursor(Qt.PointingHandCursor)
+        from characters import me
+        self.char = me()
         with open(world.asset("poses.json"), encoding="utf-8") as f:
-            self.meta = json.load(f)
-        self.orig = {p: QPixmap(world.asset(p + ".png")) for p in POSES}
+            known = json.load(f)
+        self.orig = {p: QPixmap(world.asset(f + ".png")) for p, f in self.char.poses.items()}
+        self.meta = {}
+        for p, f in self.char.poses.items():
+            w_, h_ = self.orig[p].width(), self.orig[p].height()
+            self.meta[p] = known.get(f) or {"head": [w_ / 2, 0], "hip": [w_ * 0.6, h_ * 0.72],
+                                            "hand": [w_ * 0.25, h_ * 0.45]}
         self.pose = "idle"
         self.flip = False
         self.load_sprite()
@@ -62,7 +69,7 @@ class HuaWindow(QWidget):
         self.pix = {p: self.orig[p].scaled(round(self.orig[p].width() * self.k),
                                            round(self.orig[p].height() * self.k),
                                            Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                    for p in POSES}
+                    for p in self.orig}
         self.sprite_h = size
         mw = max(p.width() for p in self.pix.values())
         mh = max(p.height() for p in self.pix.values())
@@ -80,6 +87,8 @@ class HuaWindow(QWidget):
         return self.pix[self.pose]
 
     def set_pose(self, pose):
+        if pose not in self.pix:
+            pose = "idle"
         if pose != self.pose:
             self.pose = pose
             self.pop = 1.0
@@ -120,18 +129,26 @@ class HuaWindow(QWidget):
         self.state = state
         self.state_t = 0.0
         self.state_dur = dur
-        self.set_pose(pose or {"walk": "walk", "sleep": "sleep", "pet": "pet", "dice": "dice",
-                               "rain": "umbrella", "scold": "scold"}.get(state, "idle"))
+        self.set_pose(pose or dict(self.char.state_pose, walk="walk").get(state, "idle"))
         if state != "walk":
             self.flip = False
 
     def busy(self):
-        return self.state in ("teleport", "drag", "dice", "rain", "pet", "scold")
+        return self.state in ("teleport", "drag", "dice", "rain", "pet", "scold", "scene")
 
     def step(self, dt):
         self.t += dt
         self.state_t += dt
         self.pop = max(0.0, self.pop - dt * 5)
+        r = self.w.remote
+        if r:                                   # нами управляет хозяин сцены (другой процесс)
+            self.state = "scene"
+            self.set_pose(r.get("pose", "idle"))
+            self.flip, self.opacity = bool(r.get("flip")), float(r.get("op", 1))
+            self.fx, self.fy, self.hover = float(r.get("x", self.fx)), self.w.floor_y(), float(r.get("lift", 0))
+            self.move(int(self.fx - self.W / 2), int(self.fy - self.hover - self.H + PAD_B))
+            self.update()
+            return
         a = self.w.avail
         floor = self.w.floor_y()
 
@@ -150,10 +167,11 @@ class HuaWindow(QWidget):
             if self.t > self.next_decision and not self.w.focus_active():
                 self.decide()
         elif self.state == "walk":
-            sp = 70 * self.k * 2.4
+            sp = 70 * self.k * 2.4 * getattr(self, "speed_mul", 1.0)
             d = self.target_x - self.fx
             self.flip = d < 0
             if abs(d) < 3:
+                self.speed_mul = 1.0
                 self.enter("idle")
                 self.next_decision = self.t + random.uniform(6, 15)
             else:
@@ -200,6 +218,8 @@ class HuaWindow(QWidget):
 
     def decide(self):
         w = self.w
+        if w.extra and w.extra.decide(self):     # у персонажа свои занятия
+            return
         cfg = w.cfg
         a = w.avail
         half = self.cur().width() / 2
@@ -227,12 +247,18 @@ class HuaWindow(QWidget):
             self.target_x = x
             self.enter("walk")
         elif r < 0.76:
-            self.teleport()
-        elif r < 0.84 and cfg["eming_auto"] and w.eming.state == "sheathed":
+            if self.char.teleport:
+                self.teleport()
+            else:
+                self.next_decision = self.t + random.uniform(6, 12)
+        elif r < 0.84 and self.char.eming and cfg["eming_auto"] and w.eming.state == "sheathed":
             w.eming.release()
             self.next_decision = self.t + 10
         elif r < 0.90:
-            w.roll_dice(False, quiet=True)
+            if self.char.id == "hua":           # кости — забава только Хуа Чена
+                w.roll_dice(False, quiet=True)
+            else:
+                self.next_decision = self.t + random.uniform(6, 12)
         else:
             w.swarm.release(15)
             self.next_decision = self.t + 12
@@ -243,7 +269,7 @@ class HuaWindow(QWidget):
         self.idle_since = self.w.now
         self.next_decision = self.t + random.uniform(4, 8)
         if random.random() < 0.5:
-            self.w.talk(text="Мм… Я не спал. Просто прикрыл глаз.")
+            self.w.talk("wake")
 
     def sleep(self):
         self.enter("sleep")
@@ -269,7 +295,7 @@ class HuaWindow(QWidget):
         pm = self.cur()
         dest_o = QPointF(dest_x - pm.width() / 2, self.w.floor_y() - pm.height())
         samples = self.samples[self.pose]
-        for sx, sy in random.sample(samples, min(36, len(samples))):
+        for sx, sy in random.sample(samples, min(36 if self.char.butterflies else 14, len(samples))):
             gx, gy = random.choice(samples)
             self.w.swarm.spawn_temp(o.x() + sx, o.y() + sy, goal=(dest_o.x() + gx, dest_o.y() + gy),
                                     delay=random.uniform(0.05, 0.6), then="fade",
@@ -356,12 +382,15 @@ class HuaWindow(QWidget):
         if self.busy() and self.state != "pet":
             return
         w.cfg["pets"] += 1
+        w.reward("pet")
         now = w.now
         self.pet_times = [t for t in self.pet_times if now - t < 60] + [now]
         self.enter("pet", dur=1.8)
         h = self.anchor("head")
+        if w.extra and hasattr(w.extra, "on_pet") and w.extra.on_pet(len(self.pet_times)):
+            return
         w.add_hearts(h.x(), h.y() + self.cur().height() * 0.2)
-        if len(self.pet_times) >= 5 and w.eming.state == "sheathed":
+        if self.char.eming and len(self.pet_times) >= 5 and w.eming.state == "sheathed":
             self.pet_times.clear()
             w.eming.release(jealous=True)
             return

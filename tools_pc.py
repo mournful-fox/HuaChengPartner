@@ -304,6 +304,13 @@ def play_alarm(folder):
         winsound.PlaySound(alarm_wav(folder), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
 
 
+def play_chime(folder):
+    """Один раз проиграть перезвон (для таймера)."""
+    if WIN:
+        import winsound
+        winsound.PlaySound(alarm_wav(folder), winsound.SND_FILENAME | winsound.SND_ASYNC)
+
+
 def stop_alarm():
     if WIN:
         import winsound
@@ -319,3 +326,131 @@ def press_win_h():
         k(0x48, 0, 0, 0)
         k(0x48, 0, 2, 0)
         k(0x5B, 0, 2, 0)
+
+
+def open_in_firefox(urls):
+    """Открывает ссылки в Firefox; если его нет — в браузере по умолчанию."""
+    exe = None
+    if WIN:
+        for base in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"),
+                     os.environ.get("LOCALAPPDATA")):
+            p = os.path.join(base or "", "Mozilla Firefox", "firefox.exe")
+            if os.path.exists(p):
+                exe = p
+                break
+    if exe:
+        subprocess.Popen([exe] + list(urls), close_fds=True)
+        return True
+    from PySide6.QtCore import QUrl
+    from PySide6.QtGui import QDesktopServices
+    for u in urls:
+        QDesktopServices.openUrl(QUrl(u))
+    return False
+
+
+# ── чтение документов ──
+DOC_EXT = (".docx", ".pdf", ".pptx", ".tex", ".md", ".txt", ".rtf", ".csv")
+
+
+def best_doc(folder):
+    """Главный документ в папке: сначала .docx, потом .pdf и т. д.; среди равных — самый свежий. Смотрит и на уровень глубже."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        depth = dirpath.rstrip("\\/").count(os.sep) - folder.rstrip("\\/").count(os.sep)
+        if depth >= 2:
+            dirnames[:] = []
+        for f in filenames:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in DOC_EXT and not f.startswith("~$"):
+                p = os.path.join(dirpath, f)
+                try:
+                    found.append((depth, DOC_EXT.index(ext), -os.path.getmtime(p), p))
+                except OSError:
+                    pass
+        if len(found) > 400:
+            break
+    return min(found)[3] if found else None
+
+
+def resolve_file(name):
+    """Путь к файлу по полному пути, пути без расширения, папке или просто по имени."""
+    name = os.path.expandvars((name or "").strip().strip("«»\"'")).rstrip("\\/")
+    if not name:
+        return None
+    if os.path.isfile(name):
+        return name
+    if os.path.isdir(name):                                   # дали папку — берём главный документ в ней
+        return best_doc(name)
+    parent = os.path.dirname(name)
+    if parent and os.path.isdir(parent):                      # путь без расширения (Проводник его скрывает)
+        low = os.path.basename(name).lower()
+        cands = [f for f in os.listdir(parent) if f.lower().startswith(low) and os.path.splitext(f)[1].lower() in DOC_EXT
+                 and not f.startswith("~$")]
+        if cands:
+            cands.sort(key=lambda f: (os.path.splitext(f)[0].lower() != low, DOC_EXT.index(os.path.splitext(f)[1].lower())))
+            return os.path.join(parent, cands[0])
+    base = os.path.basename(name)
+    stem = os.path.splitext(base)[0] if re.search(r"\.[A-Za-zА-Яа-я0-9]{2,5}$", base) else base
+    for q in (base, stem, " ".join(w for w in re.split(r"[\s,.\-–—_()]+", stem) if len(w) > 3)[:60]):
+        if q:
+            hits = find_paths(q, "any", limit=5, max_seconds=4.0)
+            for p, is_dir in hits:
+                if is_dir:
+                    d = best_doc(p)
+                    if d:
+                        return d
+                elif p.lower().endswith(DOC_EXT):
+                    return p
+    return None
+
+
+def read_text(path, limit=40000):
+    """Текст из .docx, .pptx, .txt, .md, .csv. Для других форматов — OSError с понятным текстом."""
+    import html
+    import zipfile
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".docx":
+        with zipfile.ZipFile(path) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "replace")
+        paras = []
+        for p in re.split(r"</w:p>", xml):
+            t = "".join(re.findall(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>", p))
+            if t.strip():
+                paras.append(html.unescape(t))
+        text = "\n".join(paras)
+    elif ext == ".pptx":
+        with zipfile.ZipFile(path) as z:
+            names = sorted((n for n in z.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                           key=lambda n: int(re.findall(r"\d+", n)[-1]))
+            parts = []
+            for n in names:
+                t = " ".join(re.findall(r"<a:t>([^<]*)</a:t>", z.read(n).decode("utf-8", "replace")))
+                parts.append(html.unescape(t))
+        text = "\n".join(parts)
+    elif ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:
+            raise OSError("для PDF нужна библиотека pypdf (pip install pypdf)") from e
+        parts, size = [], 0
+        for page in PdfReader(path).pages:
+            s = page.extract_text() or ""
+            parts.append(s)
+            size += len(s)
+            if size > limit:
+                break
+        text = "\n".join(parts)
+        if len(text.strip()) < 50:
+            raise OSError("в этом PDF нет текстового слоя (похоже, это скан)")
+    elif ext in (".txt", ".md", ".csv", ".log", ".json", ".py", ".tex", ".rtf"):
+        raw = open(path, "rb").read()
+        for enc in ("utf-8-sig", "cp1251"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", "replace")
+    else:
+        raise OSError(f"формат {ext or 'без расширения'} я читать не умею (умею .docx, .pdf, .pptx, .tex, .txt, .md, .csv)")
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    return text[:limit] + ("\n…(текст обрезан)" if len(text) > limit else "")

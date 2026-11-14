@@ -47,9 +47,12 @@ class Config(dict):
     path = None
 
     @classmethod
-    def load(cls):
+    def load(cls, char="hua"):
         cfg = cls(DEFAULTS)
-        cls.path = os.path.join(_dir(), "config.json")
+        base = _dir()
+        folder = base if char == "hua" else os.path.join(base, char)   # у каждого персонажа своя папка
+        os.makedirs(folder, exist_ok=True)
+        cls.path = os.path.join(folder, "config.json")
         saved = {}
         try:
             with open(cls.path, encoding="utf-8") as f:
@@ -61,6 +64,20 @@ class Config(dict):
             cfg["autostart"] = True
             cfg["cfg_version"] = 2
             cfg.save()
+        if char != "hua":                       # общие вещи берём у Хуа Чена: ключи, обращение, размер
+            try:
+                with open(os.path.join(base, "config.json"), encoding="utf-8") as f:
+                    main = json.load(f)
+            except (OSError, ValueError):
+                main = {}
+            if not saved:
+                cfg["autostart"] = False
+                for k in ("address", "size", "city", "provider", "model", "cloud_models", "ollama_url"):
+                    if k in main:
+                        cfg[k] = main[k]
+            keys = dict(main.get("api_keys") or {})
+            keys.update({k: v for k, v in (cfg.get("api_keys") or {}).items() if v})
+            cfg["api_keys"] = keys
         if not cfg["first_launch"]:
             cfg["first_launch"] = datetime.date.today().isoformat()
             cfg.save()
